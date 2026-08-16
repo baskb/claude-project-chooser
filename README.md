@@ -4,6 +4,8 @@ A small PowerShell script for people who keep all their Claude Code projects in 
 
 Every project gets its own color the first time you open it. The tab gets that color and the project name in the list is printed in it, so you can tell your projects apart at a glance.
 
+![The chooser: a colored list of projects, and two projects open in their own colored tabs](screenshot.png)
+
 ## What you need
 
 - Windows with Windows Terminal

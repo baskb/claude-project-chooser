@@ -219,8 +219,9 @@ open_project() {
 }
 
 # Folders named C--Users... are Claude Code housekeeping folders, not projects.
-# Recency = newest file inside the project (not the folder's own mtime, which a
-# fresh OneDrive sync sets to the sync time on every folder).
+# Recency = newest file inside the project, files only: a fresh OneDrive sync
+# stamps every folder (the project folder and the ones inside it) with the sync
+# time, while file dates survive. A project without files falls back to its mtime.
 dirNames=(); dirPaths=(); dirDates=()
 read_projects() {
     dirNames=(); dirPaths=(); dirDates=()
@@ -233,7 +234,7 @@ read_projects() {
             d=${d%/}
             [[ -d $d ]] || continue
             [[ $(basename "$d") == C--Users* ]] && continue
-            ts=$(find "$d" -mindepth 1 -maxdepth 2 \( -name .git -o -name node_modules \) -prune -o -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+            ts=$(find "$d" -mindepth 1 -maxdepth 2 \( -name .git -o -name node_modules \) -prune -o -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
             [[ -z $ts ]] && ts=$(stat -c %Y "$d")
             printf '%s\t%s\n' "$ts" "$d"
         done | sort -t $'\t' -k1,1 -rn

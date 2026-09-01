@@ -59,9 +59,27 @@ if [[ ${1:-} == --launch ]]; then
         r=$((16#${hex:1:2})); g=$((16#${hex:3:2})); b=$((16#${hex:5:2}))
         echo "${esc}[38;2;${r};${g};${b}m  Project: $name${reset}"
         # Hyprland: the window border takes the project color (best effort, like the tab color).
+        # Our window is the one owned by the terminal that started us (our parent pid). The
+        # terminal starts the shell before Hyprland lists its window, so a background loop
+        # waits for it (up to ~3 s) while claude starts; never the focused window instead,
+        # that would paint some other window. Hyprland 0.55+ is Lua-driven and sets window
+        # properties through the set_prop dispatcher; older versions had `hyprctl setprop`.
         if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command -v hyprctl >/dev/null && command -v jq >/dev/null; then
-            addr=$(hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty')
-            [[ -n $addr ]] && hyprctl setprop "address:$addr" activebordercolor "rgb(${hex:1})" >/dev/null 2>&1 || true
+            (
+                addr=""
+                for _ in $(seq 30); do
+                    addr=$(hyprctl clients -j 2>/dev/null | jq -r --argjson p "$PPID" 'map(select(.pid == $p)) | .[0].address // empty')
+                    [[ -n $addr ]] && break
+                    sleep 0.1
+                done
+                [[ -z $addr ]] && exit 0
+                set_border() {   # $1 = prop, $2 = color
+                    hyprctl dispatch "hl.dsp.window.set_prop({ window = \"address:$addr\", prop = \"$1\", value = \"$2\" })" 2>/dev/null | grep -q '^ok' \
+                        || hyprctl setprop "address:$addr" "${1//_/}" "$2" >/dev/null 2>&1 || true
+                }
+                set_border active_border_color "rgb(${hex:1})"
+                set_border inactive_border_color "rgba(${hex:1}99)"   # same color, dimmed, when not focused
+            ) &
         fi
     else
         echo "  Project: $name"

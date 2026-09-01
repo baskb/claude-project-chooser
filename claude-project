@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# claude-project — pick a Claude Code project from a list and open it.
+#
+# Linux port of Start-ClaudeProject.ps1, one-to-one in behaviour:
+# A chosen project opens in a NEW terminal window (or a new tmux window when the
+# chooser itself runs inside tmux) and the chooser stays open, so you can start
+# several projects one after another. Each project gets its own color the first
+# time it is opened (stored in .tab-colors.json in the projects root, shared with
+# the Windows version); the name in the list, the window header and — on
+# Hyprland — the window border use that color.
+#
+# Enter = most recent project, number = open that project,
+# n = new project (scaffolds a PROGRESS.md session-notes file), q = quit.
+# Type any other word to filter the list on project name (several words = all must match);
+#   * shows the full list again. Numbers always refer to the list as shown.
+# Append ! to any choice (e.g. 3!, n!, or just !) to launch in UNATTENDED mode
+#   (--dangerously-skip-permissions) for nightly sessions that must run without prompts.
+# Extra arguments are passed through to claude (e.g. --resume, --model ...).
+#
+# The projects root is read from the CLAUDE_PROJECTS_ROOT environment variable;
+# without it, ~/Claude/projects is used.
+# How a project opens is picked automatically (tmux window inside tmux, new terminal
+# window on a desktop, inline otherwise); CLAUDE_PROJECT_OPEN=window|tmux|inline overrides.
+# The new window runs this same script with --launch, which is why that mode exists
+# below — you never type --launch yourself.
+
+set -u
+
+projectsRoot=${CLAUDE_PROJECTS_ROOT:-$HOME/Claude/projects}
+projectsRoot=${projectsRoot%/}
+
+esc=$'\e'
+red="$esc[31m"; green="$esc[32m"; yellow="$esc[93m"; darkyellow="$esc[33m"
+cyan="$esc[36m"; darkgray="$esc[90m"; reset="$esc[0m"
+
+# ---- Launch mode: this is the half that runs inside the new window. ----
+# Everything it needs travels as arguments: a tmux window or a desktop launcher
+# does not necessarily carry the chooser's environment.
+if [[ ${1:-} == --launch ]]; then
+    launch=$2; shift 2
+    unattended=false; hex=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --unattended) unattended=true; shift ;;
+            --color) hex=$2; shift 2 ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+    extra=("$@")
+    name=$(basename "$launch")
+    cd "$launch" || { echo "${red}Project folder not found: $launch${reset}"; exec bash -i; }
+
+    # Window title = project name; keep Claude Code from overwriting it.
+    printf '\e]0;%s\a' "$name"
+    export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1
+
+    if [[ $hex =~ ^#[0-9a-fA-F]{6}$ ]]; then
+        r=$((16#${hex:1:2})); g=$((16#${hex:3:2})); b=$((16#${hex:5:2}))
+        echo "${esc}[38;2;${r};${g};${b}m  Project: $name${reset}"
+        # Hyprland: the window border takes the project color (best effort, like the tab color).
+        if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command -v hyprctl >/dev/null && command -v jq >/dev/null; then
+            addr=$(hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty')
+            [[ -n $addr ]] && hyprctl setprop "address:$addr" activebordercolor "rgb(${hex:1})" >/dev/null 2>&1 || true
+        fi
+    else
+        echo "  Project: $name"
+    fi
+
+    if $unattended; then
+        echo ""
+        echo "${red}  ============================================================${reset}"
+        echo "${red}   UNATTENDED MODE — running with --dangerously-skip-permissions${reset}"
+        echo "${red}   Claude will act without asking. Use only for trusted nightly work.${reset}"
+        echo "${red}  ============================================================${reset}"
+        echo "${darkgray}   Project: $launch${reset}"
+        echo "${yellow}   Ctrl+C now to abort — starting in 5s...${reset}"
+        sleep 5
+        extra+=(--dangerously-skip-permissions)
+    fi
+    command claude "${extra[@]}"
+    # Like pwsh -NoExit: keep the window usable after Claude exits (inline mode
+    # returns to the chooser instead).
+    if [[ ${CLAUDE_PROJECT_OPEN:-} != inline ]]; then
+        exec bash -i
+    fi
+    exit
+fi
+
+# ---- Chooser mode from here on. ----
+
+if [[ ! -d $projectsRoot ]]; then
+    echo "${red}Projects folder not found: $projectsRoot${reset}"
+    echo "${red}Create it, or point the CLAUDE_PROJECTS_ROOT environment variable at your projects folder.${reset}"
+    exit 1
+fi
+
+if ! command -v jq >/dev/null; then
+    echo "${red}jq is required (pacman -S jq / apt install jq).${reset}"
+    exit 1
+fi
+
+chooserScript=$(readlink -f "${BASH_SOURCE[0]}")
+claudeArgs=("$@")
+colorFile="$projectsRoot/.tab-colors.json"
+
+# Every project gets a fixed color the first time it is opened. The table lives in
+# .tab-colors.json in the projects root (OneDrive, so it travels along) and is only
+# ever appended to — a project keeps its color forever.
+declare -A colors=()
+colorCount=0
+if [[ -f $colorFile ]]; then
+    while IFS=$'\t' read -r k v; do
+        colors[$k]=$v
+        colorCount=$((colorCount + 1))
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$colorFile")
+fi
+
+# HSL -> #rrggbb, rounding half to even like PowerShell's [int] cast.
+hsl_to_hex() {
+    awk -v H="$1" -v S="$2" -v L="$3" '
+    function abs(x) { return x < 0 ? -x : x }
+    function rhe(x,   f, d) { f = int(x); d = x - f; if (d > 0.5) return f + 1; if (d < 0.5) return f; return (f % 2 == 0) ? f : f + 1 }
+    BEGIN {
+        c = (1 - abs(2 * L - 1)) * S
+        hp = H / 60; x = c * (1 - abs((hp - 2 * int(hp / 2)) - 1))
+        m = L - c / 2
+        s = int(hp) % 6
+        if (s == 0) { r = c; g = x; b = 0 } else if (s == 1) { r = x; g = c; b = 0 }
+        else if (s == 2) { r = 0; g = c; b = x } else if (s == 3) { r = 0; g = x; b = c }
+        else if (s == 4) { r = x; g = 0; b = c } else { r = c; g = 0; b = x }
+        printf "#%02x%02x%02x\n", rhe((r + m) * 255), rhe((g + m) * 255), rhe((b + m) * 255)
+    }'
+}
+
+project_color() {
+    local name=$1
+    if [[ -z ${colors[$name]:-} ]]; then
+        # 137.5 degrees further around the color circle per new project: every
+        # next color sits far away from all the earlier ones.
+        local hue
+        hue=$(awk -v n="$colorCount" 'BEGIN { h = n * 137.5; printf "%s", h - 360 * int(h / 360) }')
+        colors[$name]=$(hsl_to_hex "$hue" 0.65 0.50)
+        colorCount=$((colorCount + 1))
+        if [[ -f $colorFile ]]; then
+            jq --arg n "$name" --arg h "${colors[$name]}" '. + {($n): $h}' "$colorFile" > "$colorFile.tmp" \
+                && mv "$colorFile.tmp" "$colorFile"
+        else
+            jq -n --arg n "$name" --arg h "${colors[$name]}" '{($n): $h}' > "$colorFile"
+        fi
+    fi
+    projectHex=${colors[$name]}
+}
+
+# Which way a project opens: inside tmux a new tmux window, on a desktop a new
+# terminal window, otherwise inline in this terminal.
+open_mode() {
+    case ${CLAUDE_PROJECT_OPEN:-} in
+        window|tmux|inline) printf '%s' "$CLAUDE_PROJECT_OPEN"; return ;;
+    esac
+    if [[ -n ${TMUX:-} ]]; then printf tmux
+    elif [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] && { command -v xdg-terminal-exec >/dev/null || [[ -n ${TERMINAL:-} ]]; }; then printf window
+    else printf inline
+    fi
+}
+
+# Opens the project in a new window. The window runs this script again with --launch.
+open_project() {
+    local path=$1 name=$2 unatt=$3; shift 3
+    local extra=("$@") hex
+    project_color "$name"   # sets projectHex (no subshell, so the table stays current)
+    hex=$projectHex
+    local cmd=(bash "$chooserScript" --launch "$path" --color "$hex")
+    $unatt && cmd+=(--unattended)
+    cmd+=(-- "${extra[@]}")
+
+    case $(open_mode) in
+        tmux)
+            local q="" a win
+            for a in "${cmd[@]}"; do q+=" $(printf '%q' "$a")"; done
+            win=$(tmux new-window -n "$name" -c "$path" -P -F '#{window_id}' "$q")
+            [[ -n $win ]] && tmux set-option -w -t "$win" window-status-style "fg=$hex" 2>/dev/null
+            echo "${green}Opened $name in a new tmux window.${reset}"
+            ;;
+        window)
+            local launcher=()
+            if command -v xdg-terminal-exec >/dev/null; then
+                launcher=(xdg-terminal-exec --dir="$path")
+            else
+                launcher=("$TERMINAL" -e)
+            fi
+            command -v uwsm-app >/dev/null && launcher=(uwsm-app -- "${launcher[@]}")
+            setsid -f "${launcher[@]}" "${cmd[@]}" >/dev/null 2>&1
+            echo "${green}Opened $name in a new window.${reset}"
+            ;;
+        inline)
+            echo "${green}Opening $name here — the chooser returns when Claude exits.${reset}"
+            CLAUDE_PROJECT_OPEN=inline "${cmd[@]}"
+            ;;
+    esac
+}
+
+# Folders named C--Users... are Claude Code housekeeping folders, not projects.
+# Recency = newest file inside the project (not the folder's own mtime, which a
+# fresh OneDrive sync sets to the sync time on every folder).
+dirNames=(); dirPaths=(); dirDates=()
+read_projects() {
+    dirNames=(); dirPaths=(); dirDates=()
+    local d ts line
+    while IFS=$'\t' read -r ts d; do
+        dirPaths+=("$d"); dirNames+=("$(basename "$d")")
+        dirDates+=("$(date -d "@${ts%.*}" +%Y-%m-%d)")
+    done < <(
+        for d in "$projectsRoot"/*/; do
+            d=${d%/}
+            [[ -d $d ]] || continue
+            [[ $(basename "$d") == C--Users* ]] && continue
+            ts=$(find "$d" -mindepth 1 -maxdepth 2 \( -name .git -o -name node_modules \) -prune -o -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+            [[ -z $ts ]] && ts=$(stat -c %Y "$d")
+            printf '%s\t%s\n' "$ts" "$d"
+        done | sort -t $'\t' -k1,1 -rn
+    )
+}
+read_projects
+
+# shown* is the list as last printed — every number the user types refers to it.
+shownNames=("${dirNames[@]}"); shownPaths=("${dirPaths[@]}"); shownDates=("${dirDates[@]}")
+filter=""
+unattended=false
+
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+
+while true; do
+    echo ""
+    title="Claude projects  ($projectsRoot)"
+    [[ -n $filter ]] && title+="  — filter: $filter"
+    echo "${cyan}${title}${reset}"
+    echo "${darkgray}  (a * in front of a name = that project has PROGRESS.md; a colored name = has a tab color)${reset}"
+    i=1
+    for idx in "${!shownNames[@]}"; do
+        name=${shownNames[$idx]}
+        marker=" "; [[ -f ${shownPaths[$idx]}/PROGRESS.md ]] && marker="*"
+        shownName=$name
+        if [[ -n ${colors[$name]:-} ]]; then
+            hex=${colors[$name]}
+            cr=$((16#${hex:1:2})); cg=$((16#${hex:3:2})); cb=$((16#${hex:5:2}))
+            shownName="${esc}[38;2;${cr};${cg};${cb}m${name}${reset}"
+        fi
+        printf '%3d. %s %s  (%s)\n' "$i" "$marker" "$shownName" "${shownDates[$idx]}"
+        i=$((i + 1))
+    done
+    echo ""
+    echo "${darkgray}Enter = 1 (most recent) | number = open in a new window | n = new project | q = quit${reset}"
+    echo "${darkgray}Type a word to filter on project name | type * to show all projects again${reset}"
+    echo "${darkyellow}Add ! for unattended mode (skips permission prompts) — e.g. 3! or n!${reset}"
+    read -rp "Project: " entry || { echo; exit 0; }
+    entry=$(trim "$entry")
+
+    # An appended ! opts this launch into unattended (skip-permissions) mode.
+    # Only strip it when what remains is a real choice, so a search word keeps its !.
+    stripped=$(trim "${entry//!/}")
+    if [[ $entry == *!* && ( -z $stripped || $stripped == n || $stripped =~ ^[0-9]+$ ) ]]; then
+        unattended=true
+        entry=$stripped
+    fi
+
+    if [[ $entry == '*' ]]; then
+        shownNames=("${dirNames[@]}"); shownPaths=("${dirPaths[@]}"); shownDates=("${dirDates[@]}")
+        filter=""; unattended=false
+        continue
+    fi
+
+    [[ $entry == q ]] && exit 0
+
+    if [[ $entry == n ]]; then
+        read -rp "New project name: " newName || { echo; exit 0; }
+        newName=$(trim "$newName")
+        if [[ -z $newName ]]; then unattended=false; continue; fi
+        target="$projectsRoot/$newName"
+        if [[ ! -d $target ]]; then
+            mkdir -p "$target"
+            cat > "$target/PROGRESS.md" <<EOF
+# PROGRESS — $newName
+
+## Current focus
+New project, nothing done yet.
+
+## Done this session
+-
+
+## Next up
+-
+
+## Open questions / blockers
+-
+
+## In-flight work
+- None.
+EOF
+            echo "${green}Created $target with PROGRESS.md scaffold.${reset}"
+        fi
+        open_project "$target" "$newName" "$unattended" "${claudeArgs[@]}"
+    elif [[ -z $entry || $entry =~ ^[0-9]+$ ]]; then
+        # A number out of range is easy to type right after the list renumbered,
+        # so say so and stay in the list instead of dropping out of the script.
+        if [[ $entry =~ ^[0-9]+$ ]] && (( 10#$entry < 1 || 10#$entry > ${#shownNames[@]} )); then
+            echo "${red}There is no $entry in this list (1-${#shownNames[@]}).${reset}"
+            unattended=false
+            continue
+        fi
+        idx=$(( ${entry:-1} - 1 ))
+        open_project "${shownPaths[$idx]}" "${shownNames[$idx]}" "$unattended" "${claudeArgs[@]}"
+    else
+        # A ! only switches on unattended mode next to a real choice; on a search word it is
+        # dropped, with a note, rather than silently arming the mode or killing the search.
+        if [[ $entry == *!* ]]; then
+            echo "${darkgray}Ignoring the ! — add it to the choice you launch with (e.g. 2!).${reset}"
+            entry=$(trim "${entry//!/}")
+            [[ -z $entry ]] && continue
+        fi
+
+        read -ra words <<< "$entry"
+        matchedNames=(); matchedPaths=(); matchedDates=()
+        shopt -s nocasematch
+        for idx in "${!dirNames[@]}"; do
+            name=${dirNames[$idx]}; ok=true
+            for w in "${words[@]}"; do
+                [[ $name == *"$w"* ]] || { ok=false; break; }
+            done
+            if $ok; then
+                matchedNames+=("$name"); matchedPaths+=("${dirPaths[$idx]}"); matchedDates+=("${dirDates[$idx]}")
+            fi
+        done
+        shopt -u nocasematch
+        if (( ${#matchedNames[@]} == 0 )); then
+            echo "${red}No project name contains: $entry${reset}"
+            continue
+        fi
+        shownNames=("${matchedNames[@]}"); shownPaths=("${matchedPaths[@]}"); shownDates=("${matchedDates[@]}")
+        filter=$entry
+        unattended=false
+        continue
+    fi
+
+    # A window was just opened: re-read the list (the opened or new project moves up)
+    # and start clean, without filter or armed unattended mode.
+    read_projects
+    shownNames=("${dirNames[@]}"); shownPaths=("${dirPaths[@]}"); shownDates=("${dirDates[@]}")
+    filter=""
+    unattended=false
+done

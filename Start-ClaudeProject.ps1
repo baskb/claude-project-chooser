@@ -1,4 +1,4 @@
-#Requires -Version 7
+﻿#Requires -Version 7
 <#
 Start-ClaudeProject.ps1 — pick a Claude Code project from a list and open it.
 A chosen project opens in a NEW Windows Terminal tab (in the same window) and the
@@ -48,6 +48,13 @@ if ($Launch) {
         Start-Sleep -Seconds 5
         $extra += '--dangerously-skip-permissions'
     }
+    # Windows Terminal keeps --title/--suppressApplicationTitle only as overrides on the
+    # tab and drops them when it rebuilds its tabs (screen lock, docking, theme signal;
+    # microsoft/terminal #15732). After that Claude's own title (the "* summary" text)
+    # shows up. So: tell Claude Code never to touch the title, and set the console
+    # title to the project name ourselves, so a rebuilt tab falls back to that name.
+    $env:CLAUDE_CODE_DISABLE_TERMINAL_TITLE = '1'
+    $Host.UI.RawUI.WindowTitle = Split-Path $Launch -Leaf
     claude @extra
     return
 }

@@ -1,4 +1,4 @@
-﻿#Requires -Version 7
+#Requires -Version 7
 <#
 Start-ClaudeProject.ps1 — pick a Claude Code project from a list and open it.
 A chosen project opens in a NEW Windows Terminal tab (in the same window) and the
